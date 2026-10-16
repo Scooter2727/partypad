@@ -14,6 +14,22 @@ phone browser --WebRTC/relay--> PartyPad --DSU/UDP--> Dolphin
                                   +--uinput/evdev--> RetroArch
 ```
 
+## WiiTogether desktop integration
+
+The WiiTogether Dolphin fork provides a modeless **Connect Phones** dialog for
+local Wi-Fi play. Select the PartyPad source folder with its installed `.venv`
+(`uv sync`), then start the server from the dialog. It displays a QR code, a
+copyable HTTPS URL, and four PartyPad/DSU player slots. Closing the dialog keeps
+the bridge running; Stop or exiting Dolphin ends it. Existing Dolphin controller
+mappings are still required. Phones must accept the local certificate warning
+and grant motion access. This source integration does not yet bundle Python or
+remove the existing OpenSSL requirement for certificate generation.
+
+For desktop process owners, `--state-file PATH --stop-file PATH` enables managed
+local mode. Readiness is published after HTTPS and DSU bind, with an SVG QR beside
+the JSON state file. Creating the stop file requests normal aiohttp cleanup.
+Online dashboard behavior and ordinary CLI startup remain unchanged.
+
 ## Current goals
 
 - Make local multiplayer easy: join from a phone in seconds.

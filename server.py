@@ -30,6 +30,7 @@ from pathlib import Path
 
 from aiohttp import web, WSMsgType
 import qrcode
+import qrcode.image.svg
 
 from online_transport import OnlineHost, available_update, create_session, load_device_token
 from systems import SUPPORTED_SYSTEMS, SYSTEMS, get_system
@@ -665,7 +666,23 @@ def write_runtime_state(app) -> None:
     """Atomically expose bounded loopback-dashboard state to a parent process."""
     path = app.get("state_file")
     session = app.get("online_session")
-    if path is None or session is None:
+    if path is None:
+        return
+    if session is None:
+        runtime = app.get("local_runtime")
+        if runtime is None or not runtime["ready"]:
+            return
+        state = {
+            "version": 1,
+            "ready": True,
+            "join_url": app["local_url"],
+            "dsu_host": "127.0.0.1",
+            "dsu_port": DSU_PORT,
+            "players": [{"player": pad.slot + 1} for pad in app["hub"].pads if pad.connected],
+        }
+        if state != runtime["last_state"]:
+            atomic_write_state(path, state)
+            runtime["last_state"] = state
         return
     host = app.get("online_host")
     players = []
@@ -686,6 +703,10 @@ def write_runtime_state(app) -> None:
         "expires_at": session.get("expires_at"),
         "players": players,
     }
+    atomic_write_state(path, state)
+
+
+def atomic_write_state(path, state):
     temporary = path.with_name(f".{path.name}.{os.getpid()}")
     temporary.unlink(missing_ok=True)
     descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -698,6 +719,33 @@ def write_runtime_state(app) -> None:
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+async def run_managed_local(app, host, port, ssl_context, stop_file):
+    """Publish readiness after both listeners bind; stop without Windows signals."""
+    app["local_runtime"] = {"ready": False, "last_state": None}
+    async def close_phones(application):
+        await asyncio.gather(*(
+            connection.close(code=1001, message=b"PartyPad stopped")
+            for connection in list(application["hub"].connection_by_slot.values())
+        ))
+
+    app.on_shutdown.append(close_phones)
+    runner = web.AppRunner(app, shutdown_timeout=2)
+    try:
+        await runner.setup()
+        site = web.TCPSite(runner, host, port, ssl_context=ssl_context)
+        await site.start()
+        qr = qrcode.make(app["local_url"], image_factory=qrcode.image.svg.SvgPathImage)
+        qr.save(str(app["state_file"].with_suffix(".svg")))
+        app["local_runtime"]["ready"] = True
+        while not stop_file.exists():
+            write_runtime_state(app)
+            await asyncio.sleep(0.25)
+    finally:
+        await runner.cleanup()
+        app["state_file"].unlink(missing_ok=True)
+        app["state_file"].with_suffix(".svg").unlink(missing_ok=True)
 
 
 def ensure_cert(ip: str, regen: bool = False):
@@ -791,6 +839,7 @@ def build_parser():
         help="online session service (default: https://partypad.benmross.com)",
     )
     parser.add_argument("--state-file", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--stop-file", type=Path, help=argparse.SUPPRESS)
     parser.add_argument(
         "--log", action="store_true", help="write a diagnostic motion log to logs/*.jsonl"
     )
@@ -865,6 +914,8 @@ def resolve_system(args, input_func=input, output=print):
 def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.stop_file and (not args.state_file or args.online or args.ap):
+        parser.error("--stop-file requires --state-file and local Wi-Fi mode")
     try:
         system, backend = resolve_system(args)
     except ValueError as exc:
@@ -946,6 +997,7 @@ def main(argv=None):
         if app["online_session"] is not None
         else f"{scheme}://{lan_ip}:{port}/"
     )
+    app["local_url"] = url
 
     try:
         if access_point is not None:
@@ -959,13 +1011,15 @@ def main(argv=None):
             wifi_qr = qrcode.QRCode(border=1)
             wifi_qr.add_data(wifi_qr_payload(args.ap_name, args.ap_password))
             wifi_qr.make()
-            wifi_qr.print_ascii(invert=True)
+            if not args.stop_file:
+                wifi_qr.print_ascii(invert=True)
             print(f"  Wi-Fi: {args.ap_name}  password: {args.ap_password}\n")
             print("  2. Open the controller")
         qr = qrcode.QRCode(border=1)
         qr.add_data(url)
         qr.make()
-        qr.print_ascii(invert=True)
+        if not args.stop_file:
+            qr.print_ascii(invert=True)
         print(f"  {url}")
         if args.online:
             room_code = (app["online_session"] or {}).get("room_code")
@@ -978,7 +1032,10 @@ def main(argv=None):
         print()
 
         bind_host = args.host or ("127.0.0.1" if args.online else "0.0.0.0")
-        web.run_app(app, host=bind_host, port=port, ssl_context=ssl_context, print=None)
+        if args.stop_file:
+            asyncio.run(run_managed_local(app, bind_host, port, ssl_context, args.stop_file))
+        else:
+            web.run_app(app, host=bind_host, port=port, ssl_context=ssl_context, print=None)
     finally:
         if access_point is not None:
             access_point.stop()
